@@ -32,11 +32,11 @@ Uses native Python to return dict of JSON request payload
 """
 
 # pylint: disable=E1130,C0103,W0223
+import re
 from datetime import date, datetime
 from typing import Optional
 
 import shapely.wkt
-import json
 from packaging.version import Version
 from pygeoif import shape
 
@@ -45,6 +45,19 @@ from ..evaluator import Evaluator, handle
 from .util import like_to_wildcard
 
 VERSION_9_8_1 = Version("9.8.1")
+
+_DATE_ONLY_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+_DATETIME_NO_Z_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$')
+
+
+def _to_solr_date(val: str) -> str:
+    """Append T00:00:00Z (or Z) to bare date/datetime strings for Solr pdate fields."""
+    if isinstance(val, str):
+        if _DATE_ONLY_RE.match(val):
+            return f"{val}T00:00:00Z"
+        if _DATETIME_NO_Z_RE.match(val):
+            return f"{val}Z"
+    return val
 
 COMPARISON_OP_MAP = {
     ast.ComparisonOp.EQ: "{lhs}:{rhs}",
@@ -116,38 +129,45 @@ class SOLRDSLEvaluator(Evaluator):
 
     @handle(ast.And)
     def and_(self, _, lhs, rhs):
-        """Joins two filter objects with an `and` operator."""
-        # Extract the inner queries if lhs or rhs are SolrDSLQuery objects
-        lhs = unwrap_query(lhs)
-        rhs = unwrap_query(rhs)
+        """Joins two filter objects with an `and` operator.
 
-        # Merge `must` and `must_not` properly
-        combined_query = {"bool": {"must": []}}
+        Spatial {!field ...} filters live in the SolrDSLQuery 'filter' key and must
+        not be merged into bool.must (they don't work correctly in the query position
+        for Geo3D fields). Non-spatial queries are combined in bool.must as before.
+        """
+        lhs_q = lhs.get("query", "*:*") if isinstance(lhs, SolrDSLQuery) else lhs
+        rhs_q = rhs.get("query", "*:*") if isinstance(rhs, SolrDSLQuery) else rhs
+        lhs_filters = list(lhs.get("filter", [])) if isinstance(lhs, SolrDSLQuery) else []
+        rhs_filters = list(rhs.get("filter", [])) if isinstance(rhs, SolrDSLQuery) else []
+        combined_filters = lhs_filters + rhs_filters
 
-        if "bool" in lhs and "must_not" in lhs["bool"]:
-            # If `lhs` has a must_not clause, merge it
-            combined_query["bool"]["must_not"] = lhs["bool"]["must_not"]
-            lhs_must = {key: value for key, value in lhs["bool"].items() if key != "must_not"}
-            if lhs_must:
-                combined_query["bool"]["must"].append()
-        else:
-            # If `lhs` has no must_not clause, append it to must
-            combined_query["bool"]["must"].append(lhs)
-
-        if "bool" in rhs and "must_not" in rhs["bool"]:
-            # If `rhs` has a must_not clause, merge it
-            if "must_not" in combined_query["bool"]:
-                combined_query["bool"]["must_not"].extend(rhs["bool"]["must_not"])
+        # Build must list from non-trivial (non-wildcard) query parts
+        must_parts = []
+        must_not_parts = []
+        for q in [lhs_q, rhs_q]:
+            if q == "*:*":
+                continue
+            if isinstance(q, dict) and "bool" in q:
+                if "must_not" in q["bool"]:
+                    must_not_parts.extend(q["bool"]["must_not"])
+                if "must" in q["bool"]:
+                    must_parts.extend(q["bool"]["must"])
             else:
-                combined_query["bool"]["must_not"] = rhs["bool"]["must_not"]
-                rhs_must = {key: value for key, value in rhs["bool"].items() if key != "must_not"}
-                if rhs_must:
-                    combined_query["bool"]["must"].append()
-        else:
-            # If `rhs` has no must_not clause, append it to must
-            combined_query["bool"]["must"].append(rhs)
+                must_parts.append(q)
 
-        return SolrDSLQuery(combined_query)
+        if not must_parts and not must_not_parts:
+            combined_q = "*:*"
+        elif not must_parts and must_not_parts:
+            combined_q = {"bool": {"must_not": must_not_parts}}
+        else:
+            combined_q = {"bool": {"must": must_parts}}
+            if must_not_parts:
+                combined_q["bool"]["must_not"] = must_not_parts
+
+        result = SolrDSLQuery(combined_q)
+        if combined_filters:
+            result["filter"] = combined_filters
+        return result
 
     @handle(ast.Or)
     def or_(self, _, lhs, rhs):
@@ -188,6 +208,7 @@ class SOLRDSLEvaluator(Evaluator):
         """
         Creates a range query for comparison operators.
         """
+        rhs = _to_solr_date(rhs)
         return SolrDSLQuery(f"{COMPARISON_OP_MAP[node.op]}".format(lhs=lhs, rhs=rhs))
 
     @handle(ast.Between)
@@ -195,6 +216,8 @@ class SOLRDSLEvaluator(Evaluator):
         """
         Creates a range query for between conditions.
         """
+        low = _to_solr_date(low)
+        high = _to_solr_date(high)
         range_query = f"{lhs}:[{low} TO {high}]"
         if node.not_:
             # Negate the range query for NOT Between
@@ -206,7 +229,7 @@ class SOLRDSLEvaluator(Evaluator):
         """
         Creates a terms query for `IN` conditions.
         """
-        options_str = " OR ".join(json.dumps(str(option)) for option in options)
+        options_str = " OR ".join(str(option) for option in options)
         terms_query = f"{lhs}:({options_str})"
         if node.not_:
             # Negate the terms query for NOT IN
@@ -294,10 +317,24 @@ class SOLRDSLEvaluator(Evaluator):
     @handle(values.Geometry)
     def geometry(self, node: values.Geometry):
         """Geometry values are converted to a Solr spatial query."""
-        """Convert to wkt and make sure polygons are counter clockwise"""
         geom_wkt = shape(node).wkt
         geom = shapely.wkt.loads(geom_wkt)
-        if geom.geom_type == "Polygon" or geom.geom_type == "MultiPolygon":
+        if geom.geom_type == "Polygon":
+            # Rectangular polygons (from BBox) must use ENVELOPE format for Geo3D.
+            # WKT polygons with coordinates at ±180/±90 are "coplanar" in 3D space
+            # (poles and antimeridian are degenerate points), causing Solr to reject
+            # or mishandle them. ENVELOPE is safe and correct for axis-aligned boxes.
+            coords = list(geom.exterior.coords)
+            if (
+                len(coords) == 5
+                and len({c[0] for c in coords[:-1]}) == 2
+                and len({c[1] for c in coords[:-1]}) == 2
+            ):
+                minx, miny, maxx, maxy = geom.bounds
+                # Global bbox covers the whole Earth — spatial predicate is a no-op.
+                if minx <= -180 and miny <= -90 and maxx >= 180 and maxy >= 90:
+                    return None
+                return f"ENVELOPE({minx}, {maxx}, {maxy}, {miny})"
             geom = geom.reverse() if not geom.exterior.is_ccw else geom
         return geom.wkt
 
@@ -306,12 +343,13 @@ class SOLRDSLEvaluator(Evaluator):
         """
         Creates a term query for equality or inequality conditions.
         """
+        rhs = _to_solr_date(rhs)
         if node.op == ast.ComparisonOp.EQ:
             # Use a term query for equality
-            return SolrDSLQuery(f"{lhs}:\"{rhs}\"")
+            return SolrDSLQuery(f"{lhs}:{rhs}")
         elif node.op == ast.ComparisonOp.NE:
             # Use a boolean must_not query for inequality
-            return SolrDSLQuery(f"-{lhs}:\"{rhs}\"")
+            return SolrDSLQuery(f"-{lhs}:{rhs}")
 
     @handle(ast.TemporalPredicate, subclasses=True)
     def temporal(self, node: ast.TemporalPredicate, lhs, rhs):
@@ -356,19 +394,20 @@ class SOLRDSLEvaluator(Evaluator):
 
     @handle(ast.GeometryIntersects, ast.GeometryDisjoint, ast.GeometryWithin, ast.GeometryContains, ast.GeometryEquals)
     def spatial_comparison(self, node: ast.SpatialComparisonPredicate, lhs: str, rhs):
-        """Creates a spatial query for the given spatial comparison
-        predicate.
-        """
-        query = {}
-        # Solr need capitalized first letter of operator
-        op = node.op.value.lower().capitalize()
-        if op == "Disjoint":
-            geo_filter = f"{{!field f={lhs} v='Intersects({rhs})'}}"
-            query = {"bool": {"must_not": [geo_filter]}}
-            return SolrDSLQuery(query)
+        """Creates a spatial query for the given spatial comparison predicate.
 
-        query = f"{{!field f={lhs} v='{op}({rhs})'}}"
-        return SolrDSLQuery(query)
+        Spatial {!field ...} queries MUST go into the Solr filter[] array, not the
+        main query field. When placed in query, Geo3D fields return wrong counts.
+        """
+        # rhs is None when geometry() detected a global bbox — no filter needed.
+        if rhs is None:
+            return SolrDSLQuery("*:*")
+        op = node.op.value.lower().capitalize()
+        geo_filter = f"{{!field f={lhs} v='Intersects({rhs})'}}"
+        if op == "Disjoint":
+            return SolrDSLQuery("*:*", filters=[{"bool": {"must_not": [geo_filter]}}])
+        geo_filter = f"{{!field f={lhs} v='{op}({rhs})'}}"
+        return SolrDSLQuery("*:*", filters=[geo_filter])
 
     @handle(ast.BBox)
     def bbox(self, node: ast.BBox, lhs):
