@@ -369,6 +369,16 @@ def test_not_disjoint_inverts_filter_to_intersects():
     assert query["filter"] == ["{!field f=geometry_jts v='Intersects(POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0)))'}"]
 
 
+def test_equality_keeps_non_date_string_terms():
+    query = to_filter(parse("str_attribute = 'Space Borne Instrument'"))
+    assert query["query"] == 'str_attribute:"Space Borne Instrument"'
+
+
+def test_equality_normalizes_date_literals():
+    query = to_filter(parse("datetime_attribute = '2000-01-01'"))
+    assert query["query"] == 'datetime_attribute:"2000-01-01T00:00:00Z"'
+
+
 def test_or_keeps_spatial_in_filter_context():
     query = to_filter(
         parse("INTERSECTS(geometry_jts, POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))) OR str_attribute LIKE 'this is a test'")

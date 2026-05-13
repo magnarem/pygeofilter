@@ -85,7 +85,7 @@ def _to_solr_date(value):
 
     if isinstance(value, datetime):
         dt = value
-    else:
+    elif isinstance(value, str):
         text = value.strip()
         if not text:
             return None
@@ -93,8 +93,14 @@ def _to_solr_date(value):
             # dateutil handles many formats:
             # 2024-11-04, 2024-11-04T10:00:00Z, 2024-11-04 10:00:00+01:00, etc.
             dt = parser.isoparse(text)
-        except ValueError:
-            dt = parser.parse(text)
+        except (ValueError, TypeError, OverflowError):
+            try:
+                dt = parser.parse(text)
+            except (ValueError, TypeError, OverflowError):
+                # Not a date-like string: keep term value as-is.
+                return value
+    else:
+        return value
 
     # If no timezone is provided, assume UTC (adjust if your source is local time).
     if dt.tzinfo is None:
@@ -408,6 +414,9 @@ class SOLRDSLEvaluator(Evaluator):
         Creates a term query for equality or inequality conditions.
         """
         rhs = _to_solr_date(rhs)
+        if isinstance(rhs, str):
+            escaped_rhs = rhs.replace('"', '\\"')
+            rhs = f'"{escaped_rhs}"'
         if node.op == ast.ComparisonOp.EQ:
             # Use a term query for equality
             return SolrDSLQuery(f"{lhs}:{rhs}")
