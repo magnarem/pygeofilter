@@ -38,7 +38,8 @@ from pygeofilter.backends.solr.evaluate import SOLRDSLEvaluator, SolrDSLQuery
 from pygeofilter.parsers.ecql import parse
 from pygeofilter.util import parse_datetime
 
-SOLR_BASE_URL = "http://localhost:8984/solr/test"  # replace with your Solr URL
+PORT=8983
+SOLR_BASE_URL = f"http://localhost:{PORT}/solr/test"  # replace with your Solr URL
 HEADERS = {
     "Content-type": "application/json",
 }
@@ -73,10 +74,6 @@ INPUT_DOCS = [
 @pytest.fixture(autouse=True, scope="session")
 def prepare():
     """Prepare the Solr instance. Add the fields needed for testing"""
-    # print('Preparing core')
-    # Create a new core
-    # res = requests.get('http://localhost:8983/solr/admin/cores?action=CREATE&name=test&configSet= /opt/solr/server/solr/configsets/_default/conf')
-    # print(res)
     # Add the field types
     field_types = [
         {
@@ -106,7 +103,7 @@ def prepare():
     for field_type in field_types:
         data = json.dumps({"add-field-type": field_type})
         requests.post(
-            "http://localhost:8984/api/cores/test/schema", headers={"Content-type": "application/json"}, data=data
+            f"http://localhost:{PORT}/api/cores/test/schema", headers={"Content-type": "application/json"}, data=data
         )
 
     # Define the fields to be added
@@ -126,7 +123,9 @@ def prepare():
     for field in fields:
         data = json.dumps({"add-field": field})
         requests.post(
-            "http://localhost:8984/api/cores/test/schema", headers={"Content-type": "application/json"}, data=data
+            f"http://localhost:{PORT}/api/cores/test/schema",
+            headers={"Content-type": "application/json"},
+            data=data,
         )
     index = "ok"
     yield index
