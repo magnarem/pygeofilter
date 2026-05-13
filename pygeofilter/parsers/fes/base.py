@@ -24,12 +24,18 @@ class FESBaseParser(XMLParser):
         return predicate
 
     @handle("And")
-    def and_(self, node: Element, lhs, rhs):
-        return ast.And(lhs, rhs)
+    def and_(self, node: Element, *args):
+        result = args[0]
+        for operand in args[1:]:
+            result = ast.And(result, operand)
+        return result
 
     @handle("Or")
-    def or_(self, node: Element, lhs, rhs):
-        return ast.Or(lhs, rhs)
+    def or_(self, node: Element, *args):
+        result = args[0]
+        for operand in args[1:]:
+            result = ast.Or(result, operand)
+        return result
 
     @handle("Not")
     def not_(self, node: Element, lhs):

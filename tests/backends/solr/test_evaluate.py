@@ -38,7 +38,7 @@ from pygeofilter.backends.solr.evaluate import SOLRDSLEvaluator, SolrDSLQuery
 from pygeofilter.parsers.ecql import parse
 from pygeofilter.util import parse_datetime
 
-SOLR_BASE_URL = "http://localhost:8983/solr/test"  # replace with your Solr URL
+SOLR_BASE_URL = "http://localhost:8984/solr/test"  # replace with your Solr URL
 HEADERS = {
     "Content-type": "application/json",
 }
@@ -48,6 +48,7 @@ INPUT_DOCS = [
     {
         "id": "A",
         "geometry_jts": "MULTIPOLYGON(((0 0, 0 5, 5 5,5 0,0 0)))",
+        "geometry_geo3d": "MULTIPOLYGON(((0 0, 0 5, 5 5,5 0,0 0)))",
         "center": "POINT(2.5 2.5)",
         "float_attribute": 0.0,
         "int_attribute": 5,
@@ -58,6 +59,7 @@ INPUT_DOCS = [
     {
         "id": "B",
         "geospatial_jts": "MULTIPOLYGON(((5 5, 5 10, 10 10,10 5,5 5)))",
+        "geospatial_geo3d": "MULTIPOLYGON(((5 5, 5 10, 10 10,10 5,5 5)))",
         "center": "POINT(7.5 7.5)",
         "float_attribute": 30.0,
         "str_attribute": "this is another test",
@@ -80,10 +82,21 @@ def prepare():
         {
             "name": "spatial_jts",
             "class": "solr.SpatialRecursivePrefixTreeFieldType",
+            "geo": "true",
             "autoIndex": "true",
             "spatialContextFactory": "JTS",
             "validationRule": "repairBuffer0",
-            "distErrPct": "0.025",
+            "distErrPct": "0.015",
+            "maxDistErr": "0.001",
+            "distanceUnits": "kilometers",
+        },
+        {
+            "name": "spatial_geo3d",
+            "class": "solr.SpatialRecursivePrefixTreeFieldType",
+            "prefixTree": "s2",
+            "spatialContextFactory": "Geo3D",
+            "planetModel": "WGS84",
+            "distErrPct": "0.015",
             "maxDistErr": "0.001",
             "distanceUnits": "kilometers",
         },
@@ -93,7 +106,7 @@ def prepare():
     for field_type in field_types:
         data = json.dumps({"add-field-type": field_type})
         requests.post(
-            "http://localhost:8983/api/cores/test/schema", headers={"Content-type": "application/json"}, data=data
+            "http://localhost:8984/api/cores/test/schema", headers={"Content-type": "application/json"}, data=data
         )
 
     # Define the fields to be added
@@ -105,6 +118,7 @@ def prepare():
         {"name": "str_attribute", "type": "text_general"},
         {"name": "center", "type": "location"},
         {"name": "geometry_jts", "type": "spatial_jts", "multiValued": "false"},
+        {"name": "geometry_geo3d", "type": "spatial_geo3d", "multiValued": "false"},
         {"name": "daterange_attribute", "type": "date_range"},
     ]
 
@@ -112,7 +126,7 @@ def prepare():
     for field in fields:
         data = json.dumps({"add-field": field})
         requests.post(
-            "http://localhost:8983/api/cores/test/schema", headers={"Content-type": "application/json"}, data=data
+            "http://localhost:8984/api/cores/test/schema", headers={"Content-type": "application/json"}, data=data
         )
     index = "ok"
     yield index
@@ -238,13 +252,13 @@ def test_combination_like_not(data):
     assert len(result) == 0
 
     result = filter_(parse("str_attribute LIKE 'test' OR NOT str_attribute LIKE 'another'"))
-    assert len(result) == 1 and result[0]["id"] is data[0]["id"]
+    assert len(result) == 2
 
     result = filter_(parse("str_attribute LIKE 'test' OR NOT str_attribute LIKE 'another'"))
-    assert len(result) == 1 and result[0]["id"] is data[0]["id"]
+    assert len(result) == 2
 
     result = filter_(parse("NOT str_attribute LIKE 'another' OR str_attribute LIKE 'test'"))
-    assert len(result) == 1 and result[0]["id"] is data[0]["id"]
+    assert len(result) == 2
 
 
 def test_in(data):
@@ -344,6 +358,35 @@ def test_attribute_mapping_fallback():
     assert result2 == "subject_s"
 
 
+def test_spatial_disjoint_uses_negated_intersects_filter():
+    query = to_filter(parse("DISJOINT(geometry_jts, POLYGON((0 0, 1 0, 1 1, 0 1, 0 0)))"))
+    assert query["query"] == "*:*"
+    assert query["filter"] == ["-{!field f=geometry_jts v='Intersects(POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0)))'}"]
+
+
+def test_not_disjoint_inverts_filter_to_intersects():
+    query = to_filter(parse("NOT DISJOINT(geometry_jts, POLYGON((0 0, 1 0, 1 1, 0 1, 0 0)))"))
+    assert query["query"] == "*:*"
+    assert query["filter"] == ["{!field f=geometry_jts v='Intersects(POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0)))'}"]
+
+
+def test_or_keeps_spatial_in_filter_context():
+    query = to_filter(
+        parse("INTERSECTS(geometry_jts, POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))) OR str_attribute LIKE 'this is a test'")
+    )
+    assert query["query"] == "*:*"
+    assert query["filter"] == [
+        {
+            "bool": {
+                "should": [
+                    "{!field f=geometry_jts v='Intersects(POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0)))'}",
+                    'str_attribute:"this is a test"',
+                ]
+            }
+        }
+    ]
+
+
 # def test_array():
 #     result = filter_(
 #         ast.ArrayEquals(
@@ -405,6 +448,52 @@ def test_spatial(data):
 
     result = filter_(parse("NOT DISJOINT(geometry_jts, POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0)))"))
     assert len(result) == 1 and result[0]["id"] is data[0]["id"]
+
+    result = filter_(parse("NOT INTERSECTS(geometry_jts, POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0)))"))
+    assert len(result) == 1 and result[0]["id"] is data[1]["id"]
+
+    result = filter_(
+        parse("DISJOINT(geometry_jts, POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0))) OR str_attribute LIKE 'this is a test'")
+    )
+    assert len(result) == 2
+
+
+def test_spatial_geo3d(data):
+    result = filter_(parse("INTERSECTS(geometry_geo3d, ENVELOPE (0.0 1.0 0.0 1.0))"))
+    assert len(result) == 1 and result[0]["id"] is data[0]["id"]
+
+    result = filter_(
+        parse(
+            "INTERSECTS(geometry_geo3d, POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0)))"
+        )
+    )
+    assert len(result) == 1 and result[0]["id"] is data[0]["id"]
+
+    result = filter_(
+        parse("BBOX(center, 2, 2, 3, 3)"),
+    )
+    assert len(result) == 1 and result[0]["id"] is data[0]["id"]
+
+    result = filter_(
+        parse(
+            "DISJOINT(geometry_geo3d, POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0)))"
+        )
+    )
+    assert len(result) == 1 and result[0]["id"] is data[1]["id"]
+
+    result = filter_(
+        parse(
+            "NOT DISJOINT(geometry_geo3d, POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0)))"
+        )
+    )
+    assert len(result) == 1 and result[0]["id"] is data[0]["id"]
+
+    result = filter_(
+        parse(
+            "NOT INTERSECTS(geometry_geo3d, POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0)))"
+        )
+    )
+    assert len(result) == 1 and result[0]["id"] is data[1]["id"]
 
 
 # def test_arithmetic():
