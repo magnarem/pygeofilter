@@ -41,8 +41,8 @@ jobs:
     - name: Install and run Solr 📦 
       uses: OSGeo/solr-action@main
       with:
-        solr_version: 9.8.1
-        host_port: 8983
+        solr_version: 9.10
+        host_port: 8984
         container_port: 8983
     - name: Install and run OpenSearch 📦
       uses: esmarkowski/opensearch-github-action@v1.0.0
