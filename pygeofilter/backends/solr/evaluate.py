@@ -404,7 +404,8 @@ class SOLRDSLEvaluator(Evaluator):
                 # Global bbox covers the whole Earth — spatial predicate is a no-op.
                 if minx <= -180 and miny <= -90 and maxx >= 180 and maxy >= 90:
                     return None
-                # return f"ENVELOPE({minx}, {maxx}, {maxy}, {miny})"
+                if (minx <= -179.9999 and maxx >= 179.9999) or (miny <= -89.9999 and maxy >= 89.9999):
+                    return f"ENVELOPE({minx}, {maxx}, {maxy}, {miny})"
             geom = geom.reverse() if not geom.exterior.is_ccw else geom
         return geom.wkt
 
